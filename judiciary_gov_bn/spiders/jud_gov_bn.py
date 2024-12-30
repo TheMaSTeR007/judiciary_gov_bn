@@ -1,18 +1,23 @@
 from scrapy.cmdline import execute
+from lxml.html import fromstring
 from datetime import datetime
 from typing import Iterable
 from scrapy import Request
 import pandas as pd
 import urllib.parse
-import lxml.html
+import unicodedata
 import random
-import string
 import scrapy
 import json
 import time
 import evpn
 import os
 import re
+
+
+# Function to remove all punctuation
+def remove_punctuation(text):
+    return text if text == 'N/A' else ''.join(char for char in text if not unicodedata.category(char).startswith('P'))
 
 
 def get_years(case_dict: dict) -> str:
@@ -38,7 +43,7 @@ def get_attachment(case_dict: dict) -> str:
     attachment_url = 'N/A'
     attachment_html = attachment_html if attachment_html not in ['', ' ', None] else 'N/A'
     if attachment_html != 'N/A':
-        selector = lxml.html.fromstring(attachment_html)
+        selector = fromstring(attachment_html)
         url_slug = ' '.join(selector.xpath('//div//a/@href')).strip()
         attachment_url = 'https://www.judiciary.gov.bn' + url_slug
     return attachment_url if attachment_html not in ['', ' ', None] else 'N/A'
@@ -55,7 +60,7 @@ def get_presiding_judge(case_dict: dict) -> str:
     presiding_judge = 'N/A'
     presiding_judge_html = presiding_judge_html if presiding_judge_html not in ['', ' ', None] else 'N/A'
     if presiding_judge_html != 'N/A':
-        selector = lxml.html.fromstring(presiding_judge_html)
+        selector = fromstring(presiding_judge_html)
         presiding_judge = ' '.join(selector.xpath('//div//text()'))
     presiding_judge = re.sub(pattern=r'\u200b', repl='', string=presiding_judge).strip()
     presiding_judge = re.sub(pattern=r'[^\w\s]', repl='', string=presiding_judge)  # Remove punctuation from each string
@@ -80,8 +85,10 @@ def get_title(case_dict: dict, data_dict: dict) -> dict:
     # Regex pattern to match alias phrases
     alias_pattern = r'(?:Also known as|formerly known as|previously known as)\s*([^\)]+)'
 
-    for title_index, title in enumerate(cleaned_titles_list):
-        # print('title', title)
+    titles = []  # List to store all titles
+    aliases = []  # List to store all aliases
+
+    for title in cleaned_titles_list:
         alias_match = re.search(alias_pattern, title, re.IGNORECASE)  # Extract alias using regex
         if alias_match:
             alias = alias_match.group(1).strip()
@@ -91,20 +98,20 @@ def get_title(case_dict: dict, data_dict: dict) -> dict:
         else:
             title_value = title.strip()
             alias_value = 'N/A'
-        title_value = title_value.translate(str.maketrans('', '', string.punctuation))
-        alias_value = alias_value.translate(str.maketrans('', '', string.punctuation))
 
-        title_value = re.sub(pattern=r'[^\w\s]', repl='', string=title_value)  # Remove punctuation from each string
-        alias_value = re.sub(pattern=r'[^\w\s]', repl='', string=alias_value)  # Remove punctuation from each string
+        # Clean up the title and alias values by removing punctuation and extra spaces
+        title_value = remove_punctuation(text=title_value)
+        alias_value = remove_punctuation(text=alias_value)
 
-        title_value = ' '.join(title_value.split())
-        alias_value = ' '.join(alias_value.split())
+        title_value = ' '.join(title_value.split())  # Normalize spaces
+        alias_value = ' '.join(alias_value.split())  # Normalize spaces
 
-        title_indexed_key = f"title_{str(title_index + 1).zfill(2)}"
-        alias_indexed_key = f"alias_{str(title_index + 1).zfill(2)}"
+        titles.append(title_value)  # Add cleaned title to the list
+        aliases.append(alias_value)  # Add cleaned alias to the list
 
-        data_dict[title_indexed_key if title_index > 0 else 'title'] = title_value if title not in ['', ' ', None] else 'N/A'
-        data_dict[alias_indexed_key if title_index > 0 else 'alias'] = alias_value if alias_value not in ['', ' ', None] else 'N/A'
+    # Join all titles and aliases with ' | ' separator
+    data_dict['title'] = ' | '.join(titles) if titles else 'N/A'
+    data_dict['alias'] = ' | '.join(aliases) if aliases else 'N/A'
 
     return data_dict
 
@@ -118,18 +125,15 @@ class JudGovBnSpider(scrapy.Spider):
         self.api = evpn.ExpressVpnApi()  # Connecting to VPN (BRUNEI)
         self.api.connect(country_id='194')  # brunei country code
         time.sleep(5)  # keep some time delay before starting scraping because connecting
-        if self.api.is_connected:
-            print('VPN Connected!')
-        else:
-            print('VPN Not Connected!')
+        print('VPN Connected!') if self.api.is_connected else print('VPN Not Connected!')
 
-        self.final_data = list()
+        self.final_data_list = list()
         self.delivery_date = datetime.now().strftime('%Y%m%d')
 
         # Path to store the Excel file can be customized by the user
         self.excel_path = r"../Excel_Files"  # Client can customize their Excel file path here (default: govtsites > govtsites > Excel_Files)
         os.makedirs(self.excel_path, exist_ok=True)  # Create Folder if not exists
-        self.filename = fr"{self.excel_path}/{self.name}_{self.delivery_date}.xlsx"  # Filename with Scrape Date
+        self.filename = fr"{self.excel_path}/{self.name}.xlsx"  # Filename with Scrape Date
 
         self.cookies = {
             'WSS_FullScreenMode': 'false',
@@ -195,17 +199,16 @@ class JudGovBnSpider(scrapy.Spider):
             self.process_data(cases_list=cases_list)
 
         # Perform Pagination if Given Next Page URL
-        nextHref = json_dict.get('NextHref', 'NA')
-        print('-' * 50)
+        next_page_url = json_dict.get('NextHref', 'NA')
 
-        if nextHref != 'NA':
-            parsed_url = urllib.parse.urlparse(nextHref)  # Parse the URL
+        if next_page_url != 'NA':
+            parsed_url = urllib.parse.urlparse(next_page_url)  # Parse the URL
             qp = urllib.parse.parse_qs(parsed_url.query)  # Extract query parameters
             query_params = {key: value[0] for key, value in qp.items()}  # Convert query_params to a flat dictionary
             query_params['View'] = params['View']
             params.update(query_params)  # Update the existing params with the new ones from nextHref
-            new_query_string = urllib.parse.urlencode(params)  # Construct the new URL with the updated params
-            url = 'https://www.judiciary.gov.bn/_layouts/15/inplview.aspx?' + new_query_string
+            next_page_query_string = urllib.parse.urlencode(params)  # Construct the new URL with the updated params
+            url = 'https://www.judiciary.gov.bn/_layouts/15/inplview.aspx?' + next_page_query_string
 
             yield scrapy.Request(url=url, cookies=self.cookies, headers=self.headers, method='POST', meta={'impersonate': random.choice(self.browsers)},
                                  callback=self.parse, dont_filter=True, cb_kwargs={'groupString': groupString, 'params': params})
@@ -226,27 +229,29 @@ class JudGovBnSpider(scrapy.Spider):
             # 'name': get_name(case_dict=case_dict),  # Name
             data_dict = get_title(case_dict=case_dict, data_dict=data_dict)
 
-            print('data_dict', data_dict)
-            self.final_data.append(data_dict)
-            print('++++++++++')
+            # print('data_dict', data_dict)
+            self.final_data_list.append(data_dict)
 
     def close(self, reason):
         print('closing spider...')
-        print("Converting List of Dictionaries into DataFrame, then into Excel file...")
-        try:
-            print("Creating Native sheet...")
-            data_df = pd.DataFrame(self.final_data)
-            priority_columns = ["url", "title", "alias", "case_number", "attachment"]
-            columns_required = priority_columns + [col for col in data_df.columns if col not in priority_columns]
-            data_df = data_df[columns_required]
-            # data_df = df_cleaner(data_frame=data_df)  # Apply the function to all columns for Cleaning
-            with pd.ExcelWriter(path=self.filename, engine='xlsxwriter') as writer:
-                data_df.to_excel(excel_writer=writer, index=False)
-            print("Native Excel file Successfully created.")
-        except Exception as e:
-            print('Error while Generating Native Excel file:', e)
+        if self.final_data_list:
+            try:
+                print("Creating Native sheet...")
+                data_df = pd.DataFrame(self.final_data_list)
+                priority_columns = ["url", "title", "alias", "case_number", "attachment"]
+                columns_required = priority_columns + [col for col in data_df.columns if col not in priority_columns]
+                data_df = data_df[columns_required]
+                with pd.ExcelWriter(path=self.filename, engine='xlsxwriter') as writer:
+                    data_df.insert(loc=0, column='id', value=range(1, len(data_df) + 1))  # Add 'id' column at position 1
+                    data_df.to_excel(excel_writer=writer, index=False)
+                print("Native Excel file Successfully created.")
+            except Exception as e:
+                print('Error while Generating Native Excel file:', e)
+        else:
+            print('Final-Data-List is empty, Hence not generating Excel File.')
         if self.api.is_connected:  # Disconnecting VPN if it's still connected
             self.api.disconnect()
+            print('VPN Disconnected' if self.api.is_connected else 'VPN not Disconnected')
 
 
 if __name__ == '__main__':
